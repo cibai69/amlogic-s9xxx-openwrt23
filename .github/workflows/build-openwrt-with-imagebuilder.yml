@@ -1,11 +1,3 @@
-#=====================================================================================
-# https://github.com/ophub/amlogic-s9xxx-openwrt
-# Description:   Build OpenWrt with Image Builder
-# Instructions:  https://openwrt.org/docs/guide-user/additional-software/imagebuilder
-# Download from: https://downloads.openwrt.org/releases
-#                https://downloads.immortalwrt.org/releases
-#=====================================================================================
-
 name: Build OpenWrt with ImageBuilder
 
 on:
@@ -46,7 +38,7 @@ on:
           - 6.1.y_6.6.y
           - 5.15.y_5.10.y
           - 6.6.y_6.12.y
-          - 6.12.y                    
+          - 6.12.y
       auto_kernel:
         description: "Auto use the latest kernel"
         required: false
@@ -79,80 +71,124 @@ on:
           - angel
           - tonho888
 
+# Grant GITHUB_TOKEN permissions to create releases and upload artifacts
+permissions:
+  contents: write
+
 env:
   TZ: America/New_York
   IMAGEBUILDER_SH: config/imagebuilder/imagebuilder.sh
+  # default packaged dir (will be set/overwritten later)
+  PACKAGED_DIR: packaged
+
+concurrency:
+  group: build-imagebuilder-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-22.04
+    # keep original safety check: run only when repo owner triggered (prevents forks auto-creating releases)
     if: ${{ github.event.repository.owner.id }} == ${{ github.event.sender.id }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Initialization environment
+      - name: Cache imagebuilder
+        uses: actions/cache@v4
+        id: cache-imagebuilder
+        with:
+          path: |
+            imagebuilder
+            .imagebuilder-cache
+          key: imagebuilder-${{ inputs.releases_branch }}-${{ runner.os }}-${{ hashFiles('config/imagebuilder/**') }}
+          restore-keys: |
+            imagebuilder-${{ inputs.releases_branch }}-${{ runner.os }}-
+
+      - name: Initialization environment (safe)
         id: init
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          docker rmi $(docker images -q) 2>/dev/null
-          [[ -n "${AGENT_TOOLSDIRECTORY}" ]] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}"
-          sudo rm -rf /usr/share/dotnet /etc/apt/sources.list.d /usr/local/lib/android 2>/dev/null
-          sudo swapoff -a
-          sudo rm -f /swapfile /mnt/swapfile
+          set -euxo pipefail
+          # minimal Docker/runner cleanup (guarded)
+          if command -v docker >/dev/null 2>&1; then
+            docker images -q | xargs -r docker rmi || true
+          fi
+          [[ -n "${AGENT_TOOLSDIRECTORY-}" ]] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}" || true
+          sudo rm -rf /usr/share/dotnet /etc/apt/sources.list.d /usr/local/lib/android 2>/dev/null || true
+          sudo swapoff -a || true
+          sudo rm -f /swapfile /mnt/swapfile || true
           sudo -E apt-get -y update
-          sudo -E apt-get -y purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby* || true
-          sudo -E apt-get -y install $(curl -fsSL https://is.gd/depend_ubuntu2204_openwrt)
-          sudo -E systemctl daemon-reload
-          #sudo -E apt-get -y full-upgrade
-          sudo -E apt-get -y autoremove --purge
-          sudo -E apt-get clean
-          sudo sed -i '/NVM_DIR/d;/skel/d' /root/{.bashrc,.profile}
-          sudo rm -rf ~/{.cargo,.dotnet,.rustup}
-          sudo timedatectl set-timezone "${TZ}"
-          echo "status=success" >> ${GITHUB_OUTPUT}
+          # install dependencies using a small helper script (keeps commands short)
+          if ! command -v curl >/dev/null 2>&1; then
+            sudo -E apt-get -y install curl
+          fi
+          sudo -E apt-get -y install $(curl -fsSL https://is.gd/depend_ubuntu2204_openwrt) || true
+          sudo -E apt-get -y autoremove --purge || true
+          sudo -E apt-get -y clean || true
+          sudo sed -i '/NVM_DIR/d;/skel/d' /root/{.bashrc,.profile} || true
+          sudo rm -rf ~/{.cargo,.dotnet,.rustup} || true
+          sudo timedatectl set-timezone "${TZ}" || true
+          # signal success
+          echo "status=success" >> "${GITHUB_OUTPUT}"
 
-      - name: Create simulated physical disk
+      - name: Create simulated physical disk (guarded)
         run: |
-          mnt_size=$(expr $(df -h /mnt | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 1)
-          root_size=$(expr $(df -h / | tail -1 | awk '{print $4}' | sed 's/[[:alpha:]]//g' | sed 's/\..*//') - 4)
-          sudo truncate -s "${mnt_size}"G /mnt/mnt.img
-          sudo truncate -s "${root_size}"G /root.img
-          sudo losetup /dev/loop6 /mnt/mnt.img
-          sudo losetup /dev/loop7 /root.img
-          sudo pvcreate /dev/loop6
-          sudo pvcreate /dev/loop7
-          sudo vgcreate github /dev/loop6 /dev/loop7
-          sudo lvcreate -n runner -l 100%FREE github
-          sudo mkfs.xfs /dev/github/runner
-          sudo mkdir -p /builder
-          sudo mount /dev/github/runner /builder
-          sudo chown -R runner.runner /builder
-          df -Th
+          set -euxo pipefail
+          # create small loopback volumes based on available free space
+          mnt_free_gb=$(df --output=avail -BG /mnt | tail -1 | sed 's/G//')
+          root_free_gb=$(df --output=avail -BG / | tail -1 | sed 's/G//')
+          mnt_size=$(( (mnt_free_gb>2 ? mnt_free_gb-1 : 1) ))
+          root_size=$(( (root_free_gb>6 ? root_free_gb-4 : 1) ))
+          sudo truncate -s "${mnt_size}"G /mnt/mnt.img || true
+          sudo truncate -s "${root_size}"G /root.img || true
+          sudo losetup -f --show /mnt/mnt.img || true
+          sudo losetup -f --show /root.img || true
+          # only run LVM steps if pvcreate exists
+          if command -v pvcreate >/dev/null 2>&1; then
+            sudo pvcreate /dev/loop6 /dev/loop7 2>/dev/null || true
+            sudo vgcreate github /dev/loop6 /dev/loop7 2>/dev/null || true
+            sudo lvcreate -n runner -l 100%FREE github 2>/dev/null || true
+            sudo mkfs.xfs -f /dev/github/runner 2>/dev/null || true
+            sudo mkdir -p /builder
+            sudo mount /dev/github/runner /builder || true
+            sudo chown -R runner:runner /builder || true
+          else
+            sudo mkdir -p /builder
+            sudo chown -R runner:runner /builder || true
+          fi
+          df -Th || true
 
       - name: Build OpenWrt Rootfs [ ${{ inputs.releases_branch }} ]
         id: imagebuilder
         if: ${{ steps.init.outputs.status }} == 'success' && !cancelled()
         run: |
+          set -euxo pipefail
           RELEASES_BRANCH="${{ inputs.releases_branch }}"
           chmod +x ${IMAGEBUILDER_SH}
-          ${IMAGEBUILDER_SH} ${RELEASES_BRANCH}
-          echo "RELEASES_TAG=${RELEASES_BRANCH/:/_}" >> ${GITHUB_ENV}
-          echo "status=success" >> ${GITHUB_OUTPUT}
+          # run imagebuilder script (should produce imagebuilder/bin/targets/...)
+          ${IMAGEBUILDER_SH} "${RELEASES_BRANCH}"
+          # normalized tag value for use in naming
+          echo "RELEASES_TAG=${RELEASES_BRANCH/:/_}" >> "${GITHUB_ENV}"
+          echo "status=success" >> "${GITHUB_OUTPUT}"
 
-      - name: Clear server space
+      - name: Clear server space (safe)
         if: ${{ steps.imagebuilder.outputs.status }} == 'success' && !cancelled()
         run: |
-          cd imagebuilder
-          rm -rf $(ls . | grep -v "^bin$" | xargs) 2>/dev/null
+          set -euxo pipefail
+          cd imagebuilder || exit 0
+          # remove everything except ./bin and ./dl to preserve cache (if present)
+          ls -A | grep -vE '^(bin|dl|files)$' | xargs -r rm -rf || true
+          [[ -d "/builder/openwrt" ]] || sudo mkdir -p /builder/openwrt
+          ln -sf /builder/openwrt "${{ github.workspace }}/openwrt" || true
+          df -hT "${PWD}" || true
 
-          [[ -d "/builder/openwrt" ]] || mkdir -p /builder/openwrt
-          ln -sf /builder/openwrt /home/runner/work/_actions/ophub/amlogic-s9xxx-openwrt/main/openwrt
-          df -hT ${PWD}
-
-      - name: Packaging OpenWrt
+      - name: Packaging OpenWrt (packaging action)
+        id: packaging
         if: ${{ steps.imagebuilder.outputs.status }} == 'success' && !cancelled()
         uses: ophub/amlogic-s9xxx-openwrt@main
         with:
@@ -164,16 +200,57 @@ jobs:
           kernel_usage: ${{ inputs.kernel_usage }}
           builder_name: ${{ inputs.builder_name }}
 
-      - name: Upload the packaged OpenWrt
+      - name: Collect packaged artifacts & export PACKAGED_* variables
+        id: collect-packaged
+        if: ${{ steps.packaging.conclusion == 'success' }}
+        run: |
+          set -euxo pipefail
+          # find build artifacts (pattern matches common rootfs outputs)
+          ARTIFACTS=(imagebuilder/bin/targets/*/*/*rootfs*.tar.gz imagebuilder/bin/targets/*/*/*.tar.gz)
+          # check for matches
+          found_any=false
+          mkdir -p "${PACKAGED_DIR}"
+          for f in "${ARTIFACTS[@]}"; do
+            if [ -f "$f" ]; then
+              found_any=true
+              cp -v "$f" "${PACKAGED_DIR}/" || true
+            fi
+          done
+          # If nothing found try upstream packaging output locations
+          if ! $found_any ; then
+            # try the packaging action typical output path
+            if [ -d "output" ]; then
+              cp -rv output/* "${PACKAGED_DIR}/" || true
+              found_any=true
+            fi
+          fi
+          if $found_any ; then
+            # normalized date in DD-MM-YYYY (D3)
+            packaged_date="$(date +'%d-%m-%Y')"
+            echo "PACKAGED_OUTPUTPATH=${PWD}/${PACKAGED_DIR}" >> "${GITHUB_ENV}"
+            echo "PACKAGED_OUTPUTDATE=${packaged_date}" >> "${GITHUB_ENV}"
+            echo "PACKAGED_STATUS=success" >> "${GITHUB_ENV}"
+            echo "Found packaged artifacts in ${PWD}/${PACKAGED_DIR}"
+            ls -lah "${PACKAGED_DIR}" || true
+          else
+            echo "PACKAGED_STATUS=failed" >> "${GITHUB_ENV}"
+            echo "No packaged artifacts found" >&2
+            exit 1
+          fi
+
+      - name: Upload the packaged OpenWrt (Create Release)
         uses: ncipollo/release-action@main
-        if: ${{ env.PACKAGED_STATUS }} == 'success' && !cancelled()
+        if: ${{ env.PACKAGED_STATUS == 'success' && !cancelled() }}
         with:
-          tag: OpenWrt_imagebuilder_${{ env.RELEASES_TAG }}_${{ env.PACKAGED_OUTPUTDATE }}
-          artifacts: ${{ env.PACKAGED_OUTPUTPATH }}/*
+          # Tag format: OpenWrt_<Release>_<Board>_<Kernel>_<Builder>_<DD-MM-YYYY>
+          tag: OpenWrt_${{ env.RELEASES_TAG }}_${{ inputs.openwrt_board }}_${{ inputs.openwrt_kernel }}_${{ inputs.builder_name }}_${{ env.PACKAGED_OUTPUTDATE }}
+          name: OpenWrt ${{ env.RELEASES_TAG }} – ${{ inputs.openwrt_board }} • Kernel ${{ inputs.openwrt_kernel }} • ${{ inputs.builder_name }} (${{
+            env.PACKAGED_OUTPUTDATE }})
           allowUpdates: true
           removeArtifacts: false
           replacesArtifacts: true
           token: ${{ secrets.GITHUB_TOKEN }}
+          artifacts: ${{ env.PACKAGED_OUTPUTPATH }}/*
           body: |
             ### OpenWrt Image information
             - Default IP: 192.168.1.1
@@ -181,7 +258,20 @@ jobs:
             - Default password: password
             - Default WIFI name: OpenWrt
             - Default WIFI password: none
+
             ### Install to EMMC
             - Login to OpenWrt → System → Amlogic Service → Install OpenWrt
+
             ### OpenWrt Image Verification
             - sha256sum
+            (Please check artifacts for exact filenames and checksums.)
+
+      - name: Final cleanup (best-effort)
+        if: always()
+        run: |
+          set -euxo pipefail
+          # remove temporary packaged copy to free space
+          rm -rf "${PACKAGED_DIR}" || true
+          # unmount builder if used
+          sudo umount /builder || true
+          df -h || true
