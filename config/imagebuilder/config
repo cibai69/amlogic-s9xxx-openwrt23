@@ -1,0 +1,32 @@
+#======================================================================================
+#
+# https://github.com/ophub/amlogic-s9xxx-openwrt
+# Description: Build OpenWrt with Image Builder
+#
+# Configuration: https://github.com/openwrt/openwrt
+# Download from: https://downloads.openwrt.org/releases
+# Documentation: https://openwrt.org/docs/guide-user/additional-software/imagebuilder
+# Instructions:  Download OpenWrt firmware from the official OpenWrt,
+#                Use Image Builder to add packages, lib, theme, app and i18n, etc.
+#
+#======================================================================================
+#
+# 1. Applications
+#
+CONFIG_PACKAGE_luci-app-firewall=y
+CONFIG_PACKAGE_luci-app-opkg=y
+# end of 1. Applications
+#
+# 2. Themes
+#
+CONFIG_PACKAGE_luci-theme-bootstrap=y
+# end of 2. Themes
+#
+# 3. Translate
+#
+# end of 3. Translate
+#
+# 4. Other Configuration
+CONFIG_BUSYBOX_DEFAULT_FALLOCATE=y
+# end of 4. Other Configuration
+
